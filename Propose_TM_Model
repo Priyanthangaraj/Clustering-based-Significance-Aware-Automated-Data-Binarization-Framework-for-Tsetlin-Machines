@@ -492,7 +492,7 @@ def standard_knn_and_encoding(input_csv, optimal_k_values, Final_folder="Final_f
     # Train-test split
     X_train, X_test, y_train, y_test = train_test_split(
         df_processed.iloc[:, :-1], df_processed['label'],
-        test_size=0.15, stratify=df_processed['label'], random_state=42)
+        test_size=0.50, stratify=df_processed['label'], random_state=42)
 
     # Save the outputs
     train_df = pd.DataFrame(np.column_stack((X_train, y_train)), columns=feature_names + ['label'], dtype=int)
@@ -544,7 +544,7 @@ def main(args):
 
     # Split original test set into val and test sets (e.g., 50/50 split, can be adjusted)
     X_val, X_test, y_val, y_test = train_test_split(
-        X_test_full, y_test_full, test_size=0.15, random_state=42, stratify=y_test_full
+        X_test_full, y_test_full, test_size=0.50, random_state=42, stratify=y_test_full
     )
 
     tm = TMClassifier(
