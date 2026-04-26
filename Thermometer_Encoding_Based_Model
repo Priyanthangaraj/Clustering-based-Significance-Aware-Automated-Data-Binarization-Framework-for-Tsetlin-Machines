@@ -558,13 +558,13 @@ def plot_results(experiment_results):
     plt.show()
 
 def main(args):
-    """Train TM model with early stopping on validation set, print train & val accuracy per epoch, then evaluate on test set and measure inference time."""
-    X_train, y_train = load_dataset("Final_folder/train.csv")
-    X_test_full, y_test_full = load_dataset("Final_folder/test.csv")
+    """Train TM model on 85% training data and evaluate on 15% test data."""
 
-    # Split original test set into val and test sets (e.g., 50/50 split, can be adjusted)
-    X_val, X_test, y_val, y_test = train_test_split(
-        X_test_full, y_test_full, test_size=0.50, random_state=42, stratify=y_test_full
+    X, y = load_dataset("Final_folder_medsec/train.csv")
+
+    # ✅ 85-15 split (NO validation)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.15, random_state=42, stratify=y
     )
 
     tm = TMClassifier(
@@ -576,51 +576,30 @@ def main(args):
         weighted_clauses=args.weighted_clauses
     )
 
-    best_val_acc = 0.0
-    epochs_without_improvement = 0
-    patience = args.patience
-
-    # ---- Training loop with Early Stopping on Validation Set ----
+    # ---- Training loop (NO early stopping) ----
     for epoch in range(args.epochs):
         tm.fit(X_train, y_train)
 
         y_pred_train = tm.predict(X_train)
         train_acc = 100 * (y_pred_train == y_train).mean()
 
-        y_pred_val = tm.predict(X_val)
-        val_acc = 100 * (y_pred_val == y_val).mean()
+        _LOGGER.info(f"Epoch {epoch + 1}: Train Accuracy: {train_acc:.2f}%")
 
-        _LOGGER.info(f"Epoch {epoch + 1}: Train Accuracy: {train_acc:.2f}%, Validation Accuracy: {val_acc:.2f}%")
-
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            epochs_without_improvement = 0
-        else:
-            epochs_without_improvement += 1
-
-        if epochs_without_improvement >= patience:
-            _LOGGER.info(f"Early stopping at epoch {epoch + 1}. Best Validation Accuracy: {best_val_acc:.2f}%")
-            break
-
-    # ---- Final Evaluation on Test Set ----
+    # ---- Final Evaluation ----
     y_pred_test = tm.predict(X_test)
     test_acc = 100 * (y_pred_test == y_test).mean()
     _LOGGER.info(f"Final Test Accuracy: {test_acc:.2f}%")
 
-    # ---- Average Inference Time Per Sample ----
+    # ---- Inference Time ----
     start_time = time.time()
     num_samples = X_test.shape[0]
 
     for i in range(num_samples):
-        try:
-            _ = tm.predict(X_test[i].reshape(1, -1))
-        except IndexError as e:
-            _LOGGER.error(f"Index error at sample {i}: {e}")
-            break
+        _ = tm.predict(X_test[i].reshape(1, -1))
 
     end_time = time.time()
     avg_inference_time = (end_time - start_time) / max(num_samples, 1)
-    
+
     _LOGGER.info(f"Average Inference Time per Sample: {avg_inference_time:.6f} seconds")
 
     return test_acc, avg_inference_time
