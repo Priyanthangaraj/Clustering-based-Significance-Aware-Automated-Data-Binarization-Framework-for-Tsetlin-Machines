@@ -1,0 +1,756 @@
+# =========================
+# FULL SCRIPT (NO OPTUNA)
+# =========================
+# Requirements assumed installed:
+#   pip install pyTsetlinMachine pandas numpy scikit-learn matplotlib
+
+# --- Imports (kept close to your original; duplicates okay to preserve logic) ---
+import os
+import numpy as np
+import pandas as pd
+from sklearn.decomposition import PCA
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
+from sklearn.preprocessing import LabelEncoder, MinMaxScaler
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.metrics import silhouette_score
+import os
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import OneHotEncoder, LabelEncoder, StandardScaler
+from scipy.spatial.distance import cdist
+from sklearn.preprocessing import Binarizer
+import numpy as np
+import pandas as pd
+import logging
+import argparse
+import matplotlib.pyplot as plt
+from tmu.models.classification.vanilla_classifier import TMClassifier
+from tmu.tools import BenchmarkTimer
+from sklearn.metrics import f1_score
+import time
+
+# ---------- MANUAL TM HYPERPARAMETERS ----------
+# Set your Tsetlin Machine hyperparameters here
+MANUAL_TM_PARAMS = {
+    "num_clauses": 560,  # e.g., 328
+    "T": 100,             # e.g., 50
+    "s": 10            # e.g., 3.0
+}
+# -----------------------------------------------
+
+# ---------- Multi-GPU visibility (does not change modeling logic) ----------
+def init_multi_gpu():
+    """
+    Make all CUDA devices visible if available. This does not alter your TMClassifier
+    calls; it simply exposes multiple GPUs so the underlying CUDA kernels may utilize them
+    if supported.
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            n = torch.cuda.device_count()
+            if n > 1:
+                os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+                os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(n))
+                logging.getLogger(__name__).info(
+                    f"Multi-GPU enabled: {n} GPUs visible ({os.environ['CUDA_VISIBLE_DEVICES']})"
+                )
+            else:
+                logging.getLogger(__name__).info("Single GPU detected; proceeding with CUDA.")
+        else:
+            logging.getLogger(__name__).info("No CUDA devices detected; proceeding on CPU.")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Could not initialize multi-GPU visibility: {e}")
+
+# ---------------------- Your original cleaning / merge block (RUNS ONCE) ----------------------
+def run_data_input_and_cleaning_once():
+    folder_path = "Final_folder"
+    if os.path.isdir(folder_path):
+        for filename in os.listdir(folder_path):
+            file_path = os.path.join(folder_path, filename)
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+
+    # Ask user for input dataset path
+    input_path = input("Enter the path to the dataset (CSV file or folder): ").strip()
+    Final_folder = "Final_folder"
+    os.makedirs(Final_folder, exist_ok=True)
+    merged_output_file = os.path.join(Final_folder, "merged_DDoS.csv")
+
+    # Function to clean a dataset
+    def clean_dataset(df):
+        """
+        Cleans the given DataFrame:
+        - Fills missing values using forward fill (ffill).
+        - Drops completely empty rows and columns.
+        """
+        for col in df.select_dtypes(include=['object']).columns:
+            df[col] = df[col].astype(str).fillna('missing')  # Ensure consistent string typing
+            df[col] = LabelEncoder().fit_transform(df[col])
+
+        df = df.dropna()
+        df_cleaned = df.dropna(how='all')
+        df_cleaned = df_cleaned.dropna(axis=1, how='all')
+        return df_cleaned
+
+    # Check if the input path is a file or folder
+    if os.path.isfile(input_path) and input_path.endswith(".csv"):
+        print(f"\n📄 Processing single CSV file: {input_path}")
+
+        df = pd.read_csv(input_path)
+        df_cleaned = clean_dataset(df)
+
+        cleaned_file_path = os.path.join(Final_folder, f"cleaned_{os.path.basename(input_path)}")
+        df_cleaned.to_csv(cleaned_file_path, index=False)
+        print(f"✅ Cleaned file saved: {cleaned_file_path}")
+
+        # Save as merged_DDoS.csv too
+        df_cleaned.to_csv(merged_output_file, index=False)
+        print(f"✅ Merged dataset saved: {merged_output_file}")
+
+    elif os.path.isdir(input_path):
+        print(f"\n📁 Processing multiple CSV files from folder: {input_path}")
+
+        csv_files = [f for f in os.listdir(input_path) if f.endswith('.csv')]
+
+        if not csv_files:
+            print("❌ No CSV files found in the folder.")
+            raise SystemExit(1)
+
+        merged_data = []
+        label_column_exists = any("label" in pd.read_csv(os.path.join(input_path, f), nrows=5).columns for f in csv_files)
+
+        if label_column_exists:
+            print("🔍 Detected existing 'label' column in files. Merging without modifying labels.")
+
+            for file in csv_files:
+                file_path = os.path.join(input_path, file)
+                try:
+                    df = pd.read_csv(file_path)
+                    df_cleaned = clean_dataset(df)
+                    merged_data.append(df_cleaned)
+
+                    cleaned_file_path = os.path.join(Final_folder, f"cleaned_{file}")
+                    df_cleaned.to_csv(cleaned_file_path, index=False)
+                    print(f"✅ Cleaned data saved: {cleaned_file_path}")
+
+                except Exception as e:
+                    print(f"❌ Error processing {file}: {e}")
+
+        else:
+            different_classes = input("Do these files belong to different classes? (yes/no): ").strip().lower() == "yes"
+
+            if different_classes:
+                unique_labels = {}
+                label_counter = 0
+
+                for file in csv_files:
+                    file_path = os.path.join(input_path, file)
+                    print(f"\nProcessing {file}...")
+
+                    try:
+                        df = pd.read_csv(file_path)
+                        df_cleaned = clean_dataset(df)
+
+                        unique_labels[file] = label_counter
+                        df_cleaned["label"] = label_counter
+                        label_counter += 1
+
+                        cleaned_file_path = os.path.join(Final_folder, f"cleaned_{file}")
+                        df_cleaned.to_csv(cleaned_file_path, index=False)
+                        print(f"✅ Cleaned data saved: {cleaned_file_path}")
+
+                        merged_data.append(df_cleaned)
+
+                    except Exception as e:
+                        print(f"❌ Error processing {file}: {e}")
+
+                print("\n🔢 Assigned labels:")
+                for file, label in unique_labels.items():
+                    print(f"{file}: {label}")
+
+            else:
+                for file in csv_files:
+                    file_path = os.path.join(input_path, file)
+                    print(f"\nProcessing {file}...")
+
+                    try:
+                        df = pd.read_csv(file_path)
+                        df_cleaned = clean_dataset(df)
+
+                        cleaned_file_path = os.path.join(Final_folder, f"cleaned_{file}")
+                        df_cleaned.to_csv(cleaned_file_path, index=False)
+                        print(f"✅ Cleaned data saved: {cleaned_file_path}")
+
+                        merged_data.append(df_cleaned)
+
+                    except Exception as e:
+                        print(f"❌ Error processing {file}: {e}")
+
+        # Merge all cleaned data and save
+        if merged_data:
+            merged_df = pd.concat(merged_data, ignore_index=True)
+            merged_df.to_csv(merged_output_file, index=False)
+            print(f"\n✅ Merged dataset saved: {merged_output_file}")
+
+    else:
+        print("❌ Invalid input path. Please provide a valid CSV file or folder.")
+        raise SystemExit(1)
+
+    print("\n✅ Data cleaning completed successfully!")
+    return merged_output_file  # path to cleaned+merged CSV
+
+# ---------------------- Preprocess + K selection + encoding (your logic) ----------------------
+# Function to preprocess the dataset: handling categorical encoding and separating features and labels
+def preprocess_dataset(file_path):
+    df = pd.read_csv(file_path)
+
+    # Identify and encode categorical columns
+    categorical_cols = df.select_dtypes(include=['object']).columns
+    for col in categorical_cols:
+        df[col] = LabelEncoder().fit_transform(df[col])
+
+    # Extract features and labels
+    if 'label' in df.columns:
+        y = df['label'].astype(int)
+        X = df.drop(columns=['label'])
+    else:
+        y = None
+        X = df
+
+    return X, y, X.columns.tolist()
+
+# Function to sample the data based on the size of the dataset
+def sample_data(X, y, sample_size_ratio=0.2):
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    data_size = len(X_scaled)
+    sample_size = int(sample_size_ratio * data_size) if data_size <= 100000 else int(0.1 * data_size)
+
+    if y is not None:
+        X_sample, _, y_sample, _ = train_test_split(X_scaled, y, train_size=sample_size, stratify=y, random_state=42)
+    else:
+        minmax_scaler = MinMaxScaler()
+        X_normalized = minmax_scaler.fit_transform(X_scaled)
+        sum_scores = np.sum(X_normalized, axis=1)
+        sorted_indices = np.argsort(sum_scores)
+        low_samples = sorted_indices[:sample_size // 2]
+        high_samples = sorted_indices[-(sample_size // 2):]
+        selected_indices = np.concatenate((low_samples, high_samples))
+        X_sample = X_scaled[selected_indices].reshape(-1, X.shape[1])
+
+    return X_sample
+
+# Function to compute the optimal 'k' for each feature using silhouette scores
+def compute_optimal_k(X_sample, feature_names):
+    feature_k_values = {}
+
+    for feature_idx, feature_name in enumerate(feature_names):
+        X_feature = X_sample[:, feature_idx].reshape(-1, 1)
+        k_values = range(2, 12)
+        silhouette_scores_list = []
+
+        for k in k_values:
+            kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+            labels = kmeans.fit_predict(X_feature)
+            try:
+                score = silhouette_score(X_feature, labels)
+                silhouette_scores_list.append(score)
+            except ValueError:
+                silhouette_scores_list.append(-1)
+
+        optimal_k = k_values[np.argmax(silhouette_scores_list)] if max(silhouette_scores_list) > -1 else 1
+        feature_k_values[feature_name] = optimal_k
+
+    return feature_k_values
+
+def thermometer_encode(labels, num_levels):
+    """
+    Thermometer encoding for cluster labels.
+    Example: label 3 with levels 5 -> [1,1,1,0,0]
+    """
+    encoded = np.zeros((len(labels), num_levels), dtype=int)
+    for i, label in enumerate(labels):
+        encoded[i, :label] = 1
+    return encoded
+    
+# Function to decide whether to apply standard KNN or batchwise KNN based on dataset size
+def apply_knn(X, threshold=100000):
+    print(f"\n🔍 Dataset size: {X.shape[0]}")
+    if X.shape[0] > threshold:
+        print("🔹 Large dataset detected → Applying Batchwise KNN")
+        return "batchwise"
+    else:
+        print("✅ Small dataset → Applying Standard KNN")
+        return "standard"
+
+def KNN_batchwise(optimal_k_values, input_file="Final_folder/output_lda.csv", Final_folder="Final_folder", batch_size=2000):
+    """
+    Perform KNN batchwise clustering and encoding.
+
+    Args:
+    - optimal_k_values: Dictionary with feature names as keys and optimal K values as values.
+    - input_file: Path to the input CSV file containing the data.
+    - output_folder: Path to the folder where the output CSV files will be saved.
+    - batch_size: Batch size for processing large datasets.
+    """
+
+    # ------------------ Utility Functions ------------------
+    def normalize_data(data):
+        """ Normalize the data to zero mean and unit variance """
+        scaler = StandardScaler()
+        return scaler.fit_transform(data)
+
+    def align_clusters(reference_centroids, target_centroids):
+        """ Assign labels to target centroids based on closest reference centroids (KNN-style) """
+        distances = cdist(target_centroids, reference_centroids, metric='euclidean')
+        return np.argmin(distances, axis=1)
+
+    def binary_encode(labels, num_bits=None):
+        """ Convert labels to binary representation """
+        num_classes = len(np.unique(labels))
+        num_bits = num_bits or int(np.ceil(np.log2(num_classes)))  # Set num_bits to the minimum required
+        return np.array([list(np.array([int(x) for x in format(label, f'0{num_bits}b')])) for label in labels])
+
+    # ------------------ Main Processing ------------------
+    os.makedirs(Final_folder, exist_ok=True)
+
+    if not os.path.isfile(input_file):
+        print("Error: The file does not exist.")
+        return
+
+    df = pd.read_csv(input_file)
+    df_numeric = df.select_dtypes(include=[np.number]).dropna()
+
+    # Extract labels
+    if 'label' in df_numeric.columns:
+        y = df_numeric['label'].values.astype(int)
+        df_numeric = df_numeric.drop(columns=['label'])
+    else:
+        y = np.zeros(len(df_numeric), dtype=int)
+
+    print(f"✅ Processing started.")
+
+    # Step 1: Calculate unique classes in the label column
+    unique_labels_in_y = np.unique(y)
+    num_unique_labels_in_y = len(unique_labels_in_y)
+
+    print(f"Total number of unique labels in the 'label' column: {num_unique_labels_in_y}")
+
+    # # Step 2: Decide encoding strategy based on the number of unique labels in 'label'
+    # if num_unique_labels_in_y < 5:
+    #     print(f"Using One-Hot Encoding for all features.")
+    #     encoder = OneHotEncoder(sparse_output=False, dtype=int)
+    # else:
+    #     print(f"Using Label Encoding with Binary Representation for all features.")
+    #     label_encoder = LabelEncoder()
+
+    thermal_encoded = thermometer_encode(cluster_labels, k_value)
+    encoded_df = pd.DataFrame(
+        thermal_encoded,
+        columns=[f"{feature}_therm_{i}" for i in range(k_value)]
+    )
+
+    # Step 3: Process each feature
+    encoded_features = []
+    feature_names = []
+    for feature in df_numeric.columns:
+        print(f"Processing feature: {feature}")
+        feature_column = df_numeric[feature].values.reshape(-1, 1)
+
+        # Get K for the feature from optimal_k_values, skip if not found
+        if feature not in optimal_k_values:
+            print(f"Warning: No optimal K specified for {feature}, skipping feature.")
+            continue
+        Kj = optimal_k_values[feature]
+
+        # Normalize feature data
+        feature_column_normalized = normalize_data(feature_column)
+
+        # Split into batches
+        batches = [feature_column_normalized[i:i + batch_size] for i in range(0, len(feature_column_normalized), batch_size)]
+        B = len(batches)
+
+        batch_cluster_labels = []
+
+        # Reference clustering from the first batch
+        kmeans_ref = KMeans(n_clusters=Kj, random_state=42, n_init=10)
+        ref_labels = kmeans_ref.fit_predict(batches[0])
+        ref_centroids = kmeans_ref.cluster_centers_
+        batch_cluster_labels.append(ref_labels)
+
+        # Remaining batches: align to reference centroids
+        for b in range(1, B):
+            # Assign cluster labels based on the nearest reference centroids (KNN-style)
+            target_centroids = batches[b]
+            aligned_labels = align_clusters(ref_centroids, target_centroids)
+            batch_cluster_labels.append(aligned_labels)
+
+        # Merge all batch labels
+        final_labels = np.concatenate(batch_cluster_labels)
+
+        # Conditional Encoding Based on the chosen strategy
+        # if num_unique_labels_in_y < 5:
+        #     # Use One-Hot Encoding for all features if less than 5 unique labels
+        #     encoded = encoder.fit_transform(final_labels.reshape(-1, 1))
+        #     col_names = [f"{feature}_cl_{i}" for i in range(encoded.shape[1])]
+        #     encoded_features.append(pd.DataFrame(encoded, columns=col_names))
+        #     feature_names.extend(col_names)
+        # else:
+        #     # Use Label Encoding with Binary Representation if 5 or more unique labels
+        #     encoded_labels = label_encoder.fit_transform(final_labels)
+        #     binary_encoded = binary_encode(encoded_labels)
+        #     col_names = [f"{feature}_bin_cl_{i}" for i in range(binary_encoded.shape[1])]
+        #     encoded_features.append(pd.DataFrame(binary_encoded, columns=col_names))
+        #     feature_names.extend(col_names)
+
+        thermal_encoded = thermometer_encode(cluster_labels, k_value)
+        encoded_df = pd.DataFrame(
+            thermal_encoded,
+            columns=[f"{feature}_therm_{i}" for i in range(k_value)]
+        )
+
+    # Merge Encoded Features + Label
+    df_encoded = pd.concat(encoded_features, axis=1)
+
+    # Add the original labels (y) to the encoded dataframe
+    df_encoded['label'] = y  # Preserve the original labels intact
+
+    # Train-Test Split
+    X_train, X_test, y_train, y_test = train_test_split(
+        df_encoded.iloc[:, :-1], df_encoded['label'], test_size=0.3, stratify=df_encoded['label'], random_state=42
+    )
+
+    # Save
+    train_df = pd.DataFrame(np.column_stack((X_train, y_train)), columns=feature_names + ['label'], dtype=int)
+    test_df = pd.DataFrame(np.column_stack((X_test, y_test)), columns=feature_names + ['label'], dtype=int)
+
+    train_df.to_csv(os.path.join(Final_folder, "train.csv"), index=False, header=False)
+    test_df.to_csv(os.path.join(Final_folder, "test.csv"), index=False, header=False)
+
+    print("✅ Processing complete. Encoded train/test files saved to 'Final_folder'.")
+
+
+def standard_knn_and_encoding(input_csv, optimal_k_values, Final_folder="Final_folder"):
+    """
+    Process CSV input data with KMeans clustering, encoding, and train-test split.
+    
+    Args:
+    - input_csv: Path to the input CSV file containing the data.
+    - optimal_k_values: Dictionary with feature names as keys and optimal k values as values.
+    - output_folder: Path to the folder where the output CSV files will be saved.
+    """
+    # ------------------ Utility Functions ------------------
+    def apply_one_hot_encoding(cluster_labels, feature, k_value):
+        """One-Hot encode cluster labels for the feature"""
+        one_hot_encoder = OneHotEncoder(sparse=False, dtype=int)
+        encoded_labels = one_hot_encoder.fit_transform(cluster_labels.reshape(-1, 1))
+        encoded_df = pd.DataFrame(encoded_labels, columns=[f"{feature}_cluster_{j}" for j in range(k_value)])
+        return encoded_df
+
+
+    # ------------------ Main Processing ------------------
+    os.makedirs(Final_folder, exist_ok=True)
+
+    print(f"Processing file: {input_csv}")
+    df = pd.read_csv(input_csv)
+
+    # Select only numeric columns and drop rows with missing values
+    df_numeric = df.select_dtypes(include=[np.number]).dropna()
+
+    if df_numeric.shape[1] < 2:
+        print("Not enough numeric features.")
+        return
+
+    if 'label' not in df_numeric.columns:
+        raise ValueError("Input CSV must contain a 'label' column.")
+
+    # Extract labels
+    y = df_numeric['label'].astype(int).values
+    X = df_numeric.drop(columns=['label']).copy()
+
+    # Check the number of unique classes in target variable
+    unique_classes = 4
+    
+    # ------------------ Encoding Strategy ------------------
+    all_encoded_features = []
+    feature_names = []
+
+    # Process each feature
+    for feature in X.columns:
+        k_value = optimal_k_values.get(feature, 2)  # Default to k=2 if not provided for the feature
+        print(f"Applying K-Means (k={k_value}) on {feature}...")
+
+        kmeans = KMeans(n_clusters=k_value, random_state=42, n_init=10)
+        cluster_labels = kmeans.fit_predict(X[[feature]])
+
+        # # Apply encoding based on the number of unique classes in the target variable
+        # if unique_classes < 5:
+        #     print("Target variable has fewer than 5 unique classes. Using One-Hot Encoding.")
+        #     encoded_df = apply_one_hot_encoding(cluster_labels, feature, k_value)
+        # else:
+        #     print("Target variable has 5 or more unique classes. Using Label + Binary Encoding.")
+        #     encoded_df = apply_label_binary_encoding(cluster_labels, feature, k_value)
+
+        thermal_encoded = thermometer_encode(cluster_labels, k_value)
+        encoded_df = pd.DataFrame(
+            thermal_encoded,
+            columns=[f"{feature}_therm_{i}" for i in range(k_value)]
+        )
+            
+        all_encoded_features.append(encoded_df)
+        feature_names.extend(encoded_df.columns)
+
+    # Combine all encoded features into a single DataFrame
+    df_processed = pd.concat(all_encoded_features, axis=1)
+    df_processed['label'] = y
+
+    # Train-test split
+    X_train, X_test, y_train, y_test = train_test_split(
+        df_processed.iloc[:, :-1], df_processed['label'],
+        test_size=0.50, stratify=df_processed['label'], random_state=42)
+
+    # Save the outputs
+    train_df = pd.DataFrame(np.column_stack((X_train, y_train)), columns=feature_names + ['label'], dtype=int)
+    test_df = pd.DataFrame(np.column_stack((X_test, y_test)), columns=feature_names + ['label'], dtype=int)
+
+    train_df.to_csv(os.path.join(Final_folder, "train.csv"), index=False, header=False)
+    test_df.to_csv(os.path.join(Final_folder, "test.csv"), index=False, header=False)
+
+    print(f"✅ Processing complete. Output saved to {Final_folder}/train.csv and test.csv")
+
+# ---------------------- TM + metrics (your logic, no Optuna) ----------------------
+# Setup logger
+logging.basicConfig(level=logging.INFO)
+_LOGGER = logging.getLogger(__name__)
+
+### LOAD DATA ###
+def load_dataset(file_path):
+    data = pd.read_csv(file_path)
+    X = data.iloc[:, :-1].values.astype(np.uint32)
+    y = data.iloc[:, -1].values.astype(np.uint32)
+    return X, y
+
+### PLOT RESULTS (kept; not used in the outer loop but preserved)
+def plot_results(experiment_results):
+    epochs = list(range(1, len(experiment_results["accuracy"]) + 1))
+
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs, experiment_results["accuracy"], marker='o')
+    plt.xlabel("Epochs")
+    plt.ylabel("Accuracy (%)")
+    plt.title("Accuracy Over Epochs")
+    plt.grid(True)
+
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs, experiment_results["train_time"], marker='o')
+    plt.xlabel("Epochs")
+    plt.ylabel("Train Time (s)")
+    plt.title("Training Time Over Epochs")
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+def main(args):
+    """Train TM model with early stopping on validation set, print train & val accuracy per epoch, then evaluate on test set and measure inference time."""
+    X_train, y_train = load_dataset("Final_folder/train.csv")
+    X_test_full, y_test_full = load_dataset("Final_folder/test.csv")
+
+    # Split original test set into val and test sets (e.g., 50/50 split, can be adjusted)
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_test_full, y_test_full, test_size=0.50, random_state=42, stratify=y_test_full
+    )
+
+    tm = TMClassifier(
+        number_of_clauses=args.num_clauses,
+        T=args.T,
+        s=args.s,
+        max_included_literals=args.max_included_literals,
+        platform=args.platform,
+        weighted_clauses=args.weighted_clauses
+    )
+
+    best_val_acc = 0.0
+    epochs_without_improvement = 0
+    patience = args.patience
+
+    # ---- Training loop with Early Stopping on Validation Set ----
+    for epoch in range(args.epochs):
+        tm.fit(X_train, y_train)
+
+        y_pred_train = tm.predict(X_train)
+        train_acc = 100 * (y_pred_train == y_train).mean()
+
+        y_pred_val = tm.predict(X_val)
+        val_acc = 100 * (y_pred_val == y_val).mean()
+
+        _LOGGER.info(f"Epoch {epoch + 1}: Train Accuracy: {train_acc:.2f}%, Validation Accuracy: {val_acc:.2f}%")
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        if epochs_without_improvement >= patience:
+            _LOGGER.info(f"Early stopping at epoch {epoch + 1}. Best Validation Accuracy: {best_val_acc:.2f}%")
+            break
+
+    # ---- Final Evaluation on Test Set ----
+    y_pred_test = tm.predict(X_test)
+    test_acc = 100 * (y_pred_test == y_test).mean()
+    _LOGGER.info(f"Final Test Accuracy: {test_acc:.2f}%")
+
+    # ---- Average Inference Time Per Sample ----
+    start_time = time.time()
+    num_samples = X_test.shape[0]
+
+    for i in range(num_samples):
+        try:
+            _ = tm.predict(X_test[i].reshape(1, -1))
+        except IndexError as e:
+            _LOGGER.error(f"Index error at sample {i}: {e}")
+            break
+
+    end_time = time.time()
+    avg_inference_time = (end_time - start_time) / max(num_samples, 1)
+    
+    _LOGGER.info(f"Average Inference Time per Sample: {avg_inference_time:.6f} seconds")
+
+    return test_acc, avg_inference_time
+
+### DEFAULT ARGS ###
+def default_args(**kwargs):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num_clauses", default=MANUAL_TM_PARAMS["num_clauses"], type=int)
+    parser.add_argument("--T", default=MANUAL_TM_PARAMS["T"], type=int)
+    parser.add_argument("--s", default=MANUAL_TM_PARAMS["s"], type=float)
+    parser.add_argument("--max_included_literals", default=32, type=int)
+    parser.add_argument("--platform", default="CPU", type=str)
+    parser.add_argument("--weighted_clauses", default=True, type=bool)
+    parser.add_argument("--epochs", default=100, type=int)
+    parser.add_argument("--patience", default=15, type=int)  # Early stopping patience
+    args, _ = parser.parse_known_args()
+    
+    # Update the parsed arguments with any keyword arguments provided
+    for key, value in kwargs.items():
+        if hasattr(args, key):
+            setattr(args, key, value)
+    
+    return args
+
+# ---------------------- 100-Trial Wrapper (repeats KNN+encoding+TM) ----------------------
+def run_100_trials_after_cleaned_data(merged_csv_path, num_trials=100):
+    """
+    After data input & cleaning (merged_csv_path produced), repeat:
+      preprocess -> sample -> compute_optimal_k -> apply_knn ->
+      standard/batchwise encoding (writes train/test) ->
+      train/eval Tsetlin with MANUAL_TM_PARAMS
+    for num_trials runs, collecting accuracy and per-sample inference time.
+    """
+    accs = []
+    times = []
+    run_results = [] 
+
+    for i in range(num_trials):
+        _LOGGER.info(f"\n======== TRIAL {i+1}/{num_trials}: KNN/Encoding + TM Pipeline ========")
+
+        # Preprocess & feature names
+        X, y, feature_names = preprocess_dataset(merged_csv_path)
+
+        # Decide KNN strategy
+        knn_strategy = apply_knn(X)
+
+        # Sample and determine per-feature optimal K
+        X_sample = sample_data(X, y)
+        assert X_sample.shape[1] == len(feature_names), "❌ Feature count mismatch!"
+        optimal_ks = compute_optimal_k(X_sample, feature_names)
+
+        # Display per-feature K (optional, verbose)
+        print("\n📊 Optimal K for Each Feature:")
+        for feature, k in optimal_ks.items():
+            print(f" - {feature}: {k if k else 'Not Computable'}")
+
+        # Encode and produce train/test for this trial
+        if knn_strategy == "standard":
+            standard_knn_and_encoding(merged_csv_path, optimal_ks, Final_folder="Final_folder_medsec")
+        elif knn_strategy == "batchwise":
+            # Keep original logic; pass merged_csv_path as input_file
+            KNN_batchwise(optimal_ks, merged_csv_path, Final_folder="Final_folder_medsec", batch_size=2000)
+
+        # Build args with manual hyperparameters and run training/eval
+        args = default_args()  # already defaults to MANUAL_TM_PARAMS
+        test_acc, per_sample_time = main(args)
+
+        accs.append(test_acc)
+        times.append(per_sample_time)
+        
+        # 🔥 SAVE FULL RUN INFO
+        run_results.append({
+            "Run": i + 1,
+            "s": args.s,
+            "T": args.T,
+            "num_clauses": args.num_clauses,
+            "Test Accuracy (%)": round(test_acc, 4),
+            "Avg Inference Time (s)": round(per_sample_time, 6)
+        })
+
+        _LOGGER.info(f"Trial {i+1} done. Test Acc: {test_acc:.2f}% | Per-sample time: {per_sample_time:.6f}s")
+
+    # Aggregate stats
+    acc_mean = float(np.mean(accs))
+    acc_std = float(np.std(accs, ddof=1)) if len(accs) > 1 else 0.0
+    time_mean = float(np.mean(times))
+    time_std = float(np.std(times, ddof=1)) if len(times) > 1 else 0.0
+
+    _LOGGER.info(
+        f"\n==== Summary over {num_trials} runs (KNN/Encoding + TM) ====\n"
+        f"Test Accuracy: {acc_mean:.2f}% ± {acc_std:.2f}%\n"
+        f"Per-sample Inference Time: {time_mean:.6f}s ± {time_std:.6f}s\n"
+    )
+
+    print("\n" + "="*74)
+    print(f"Summary over {num_trials} runs (KNN/Encoding + Tsetlin Machine)")
+    print(f"Test Accuracy: {acc_mean:.2f}% ± {acc_std:.2f}%")
+    print(f"Per-sample Inference Time: {time_mean:.6f}s ± {time_std:.6f}s")
+    print("="*74 + "\n")
+
+    # ================= SAVE RESULTS =================
+    df_results = pd.DataFrame(run_results)
+    
+    output_path = "Final_folder/MonteCarlo_Detailed_Results.csv"
+    df_results.to_csv(output_path, index=False)
+    
+    print(f"\n✅ Results saved to: {output_path}")
+
+    return {
+        "accuracy_mean": acc_mean,
+        "accuracy_std": acc_std,
+        "inference_time_mean": time_mean,
+        "inference_time_std": time_std,
+        "all_accuracies": accs,
+        "all_times": times,
+    }
+
+# ---------------------- Final Entrypoint ----------------------
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    _LOGGER = logging.getLogger(__name__)
+    init_multi_gpu()
+
+    # 1) Data input & cleaning (ONCE)
+    merged_csv = run_data_input_and_cleaning_once()  # produces Final_folder/merged_DDoS.csv
+
+    # 2) Repeat KNN selection + encoding + Tsetlin (manual hyperparams) 100 times
+    try:
+        summary = run_100_trials_after_cleaned_data(merged_csv, num_trials=100)
+        _LOGGER.info(summary)
+        
+    except Exception as e:
+        _LOGGER.error(f"An error occurred during 100-trial runs: {e}")
