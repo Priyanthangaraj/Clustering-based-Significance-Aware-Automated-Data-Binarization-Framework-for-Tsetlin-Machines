@@ -1,0 +1,293 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import accuracy_score, silhouette_score
+from scipy.optimize import linear_sum_assignment
+from sklearn.cluster import KMeans
+import time
+import warnings
+
+from sklearn.exceptions import ConvergenceWarning
+from tmu.models.classification.vanilla_classifier import TMClassifier
+
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
+
+plt.rcParams['font.family'] = 'Times New Roman'
+
+
+# ---------------------
+# Plot Saver
+# ---------------------
+def configure_and_save_plot(filename):
+    ax = plt.gca()
+    ax.set_aspect('auto', adjustable='box')
+    plt.legend(fontsize=10)
+    plt.xticks(fontsize=10, fontname='Times New Roman')
+    plt.yticks(fontsize=10, fontname='Times New Roman')
+    plt.xlabel(ax.get_xlabel(), fontsize=10, fontname='Times New Roman')
+    plt.ylabel(ax.get_ylabel(), fontsize=10, fontname='Times New Roman')
+    plt.title(ax.get_title(), fontsize=10, fontname='Times New Roman')
+    plt.tight_layout()
+    plt.gcf().set_size_inches(5, 5)
+    plt.savefig(f"{filename}.eps", format='eps', dpi=300)
+    plt.close()
+
+
+# ---------------------
+# Load Dataset (FIXED)
+# ---------------------
+df = pd.read_csv("processed_IoT_DH_Dataset.csv")
+df.dropna(inplace=True)
+
+# Encode categorical
+for col in df.select_dtypes(include="object").columns:
+    df[col] = pd.factorize(df[col])[0]
+
+X = df.drop("label", axis=1).reset_index(drop=True)
+
+# 🔴 FIX 1: HANDLE BOOL + FORCE NUMERIC
+for col in X.columns:
+    if X[col].dtype == bool:
+        X[col] = X[col].astype(int)
+
+X = X.apply(pd.to_numeric, errors='coerce')
+X = X.astype(np.float32)
+
+y = df["label"].reset_index(drop=True)
+
+
+# ---------------------
+# ACE Encoder
+# ---------------------
+class BufferedKMeansEncoder:
+    def __init__(self, X, y, warmup_steps=100, k_max=6, buffer_size=500, recluster_interval=300):
+        self.X = X
+        self.y = y.to_numpy().astype(np.uint32)
+        self.N, self.F = X.shape
+
+        self.warmup_steps = warmup_steps
+        self.k_max = k_max
+        self.W = buffer_size
+        self.R = recluster_interval
+
+        self.k_opt = np.zeros(self.F, dtype=int)
+        self.centroids = [None] * self.F
+        self.buffers = [list() for _ in range(self.F)]
+        self.k_range = list(range(2, k_max + 1))
+
+        self.encoded_data = []
+        self.labels = []
+
+        self.tm = None
+
+        self.predictions = []
+        self.true_labels = []
+        self.accuracy_log = []
+        self.inference_times = []
+
+    # ---------------------
+    # Robust K selection
+    # ---------------------
+    def find_optimal_k_and_init_centroids(self):
+        for i in range(self.F):
+            feature_vals = self.X.iloc[:self.warmup_steps, i].values.reshape(-1, 1)
+
+            # 🔴 constant feature
+            if np.std(feature_vals) == 0:
+                self.k_opt[i] = 1
+                self.centroids[i] = np.array([[feature_vals[0][0]]], dtype=np.float32)
+                continue
+
+            scores = []
+
+            for k in self.k_range:
+                try:
+                    km = KMeans(n_clusters=k, random_state=42, n_init=10).fit(feature_vals)
+
+                    if len(np.unique(km.labels_)) < 2:
+                        scores.append(-1)
+                        continue
+
+                    score = silhouette_score(feature_vals, km.labels_)
+                    scores.append(score)
+
+                except Exception:
+                    scores.append(-1)
+
+            best_k = 2 if max(scores) == -1 else self.k_range[int(np.argmax(scores))]
+
+            self.k_opt[i] = best_k
+
+            km_best = KMeans(n_clusters=best_k, random_state=42, n_init=10).fit(feature_vals)
+            self.centroids[i] = km_best.cluster_centers_.astype(np.float32)
+
+    # ---------------------
+    # Safe distance
+    # ---------------------
+    @staticmethod
+    def assign_cluster_one_hot(x_i, centroids_i):
+        x_i = x_i.astype(np.float32)
+        centroids_i = centroids_i.astype(np.float32)
+
+        dists = np.linalg.norm(centroids_i - x_i, axis=1)
+        idx = int(np.argmin(dists))
+
+        one_hot = np.zeros(len(centroids_i), dtype=np.uint32)
+        one_hot[idx] = 1
+        return one_hot
+
+    # ---------------------
+    # Reclustering
+    # ---------------------
+    def recluster_and_align(self, feature_idx):
+        buffer_vals = np.array(self.buffers[feature_idx], dtype=np.float32).reshape(-1, 1)
+        k = self.k_opt[feature_idx]
+
+        if k == 1:
+            return
+
+        km_new = KMeans(n_clusters=k, random_state=42, n_init=10).fit(buffer_vals)
+        new_centroids = km_new.cluster_centers_
+        old_centroids = self.centroids[feature_idx]
+
+        cost_matrix = np.linalg.norm(
+            old_centroids[:, np.newaxis] - new_centroids[np.newaxis, :], axis=2
+        )
+
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+
+        aligned = np.zeros_like(new_centroids)
+        for r, c in zip(row_ind, col_ind):
+            aligned[r] = new_centroids[c]
+
+        self.centroids[feature_idx] = aligned.astype(np.float32)
+
+    # ---------------------
+    # Main process
+    # ---------------------
+    def process(self):
+        self.find_optimal_k_and_init_centroids()
+
+        # Warmup
+        for t in range(self.warmup_steps):
+            b_t_list = []
+
+            for i in range(self.F):
+                x_i = np.array([self.X.iloc[t, i]], dtype=np.float32)
+                one_hot = self.assign_cluster_one_hot(x_i, self.centroids[i])
+                b_t_list.append(one_hot)
+
+            b_t = np.concatenate(b_t_list).astype(np.uint32)
+            self.encoded_data.append(b_t)
+            self.labels.append(self.y[t])
+
+        self.encoded_data = np.array(self.encoded_data, dtype=np.uint32)
+        self.labels = np.array(self.labels, dtype=np.uint32)
+
+        # Train TM
+        self.tm = TMClassifier(
+            number_of_clauses=560,
+            T=100,
+            s=10,
+            platform="CPU",
+            weighted_clauses=True,
+            feature_negation=True
+        )
+
+        self.tm.fit(self.encoded_data, self.labels, epochs=30)
+
+        # Streaming
+        for t in range(self.warmup_steps, self.N):
+            start_time = time.time()
+
+            b_t_list = []
+
+            for i in range(self.F):
+                x_i = self.X.iloc[t, i]
+
+                self.buffers[i].append(x_i)
+                if len(self.buffers[i]) > self.W:
+                    self.buffers[i].pop(0)
+
+                if (t - self.warmup_steps) % self.R == 0 and len(self.buffers[i]) == self.W:
+                    self.recluster_and_align(i)
+
+                x_i = np.array([x_i], dtype=np.float32)
+                one_hot = self.assign_cluster_one_hot(x_i, self.centroids[i])
+                b_t_list.append(one_hot)
+
+            b_t = np.concatenate(b_t_list).astype(np.uint32)
+            y_true = self.y[t]
+
+            y_pred = self.tm.predict(np.array([b_t], dtype=np.uint32))[0]
+
+            end_time = time.time()
+            self.inference_times.append(end_time - start_time)
+
+            self.predictions.append(int(y_pred))
+            self.true_labels.append(int(y_true))
+
+            acc = accuracy_score(self.true_labels, self.predictions)
+            self.accuracy_log.append(acc)
+
+            self.tm.fit(
+                np.array([b_t], dtype=np.uint32),
+                np.array([y_true], dtype=np.uint32),
+                epochs=1
+            )
+
+
+# ---------------------
+# Run
+# ---------------------
+np.random.seed(42)
+
+encoder = BufferedKMeansEncoder(X, y)
+encoder.process()
+
+
+# ---------------------
+# Results
+# ---------------------
+final_accuracy = encoder.accuracy_log[-1]
+avg_time = np.mean(encoder.inference_times)
+std_time = np.std(encoder.inference_times)
+
+print("\n===== FINAL RESULTS =====")
+print(f"Cumulative Accuracy: {final_accuracy * 100:.2f}%")
+print(f"Avg Inference Time: {avg_time * 1000:.4f} ms")
+print(f"Std Inference Time: {std_time * 1000:.4f} ms")
+print(f"Total Samples: {len(encoder.inference_times)}")
+print(f"Total Time: {np.sum(encoder.inference_times):.4f} sec")
+
+
+# ---------------------
+# Plot 1
+# ---------------------
+plt.figure(figsize=(12, 6))
+indices = list(range(encoder.warmup_steps, encoder.N))
+
+plt.plot(indices, encoder.accuracy_log, label="ACE")
+plt.xlabel("Sample Index")
+plt.ylabel("Cumulative Accuracy")
+plt.grid(True)
+plt.xlim(0, 2000)
+
+configure_and_save_plot("accuracy_0_2000_ACE")
+
+
+# ---------------------
+# Plot 2
+# ---------------------
+plt.figure(figsize=(12, 6))
+
+plt.plot(indices, encoder.accuracy_log, label="ACE")
+plt.xlabel("Sample Index")
+plt.ylabel("Cumulative Accuracy")
+plt.grid(True)
+plt.xlim(6000, 8000)
+
+configure_and_save_plot("accuracy_6000_8000_ACE")
+
+
+print("\nSaved EPS plots successfully.")
